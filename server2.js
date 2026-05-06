@@ -2,8 +2,8 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const moment = require('moment');
-const { v4: uuidv4 } = require('uuid');
 const mongoDataAccess = require('./mongoDataAccess');
+const protocol = require('./protocolContract');
 
 // Load environment variables
 require('dotenv').config({ path: './config.env' });
@@ -408,12 +408,7 @@ class StompConnection {
     
     handleConnect(headers) {
         this.connected = true;
-        this.send('CONNECTED', {
-            'version': '1.2',
-            'session': this.sessionId,
-            'server': 'stomp-fixed-income/1.0.0',
-            'heart-beat': '0,0'  // No heartbeat
-        });
+        this.send('CONNECTED', protocol.connectedHeaders(this.sessionId));
         console.log(`Client ${this.id} connected`);
     }
     
@@ -460,18 +455,18 @@ class StompConnection {
         
         // Enhanced trigger pattern: /snapshot/{dataType}/{clientId}/{rate}[/{batchSize}]
         const requestString = body && body.startsWith('/snapshot/') ? body : destination;
-        const match = requestString.match(/^\/snapshot\/(positions|trades)\/([^/]+)\/(\d+)(?:\/(\d+))?$/);
+        const match = requestString.match(protocol.TRIGGER_CLIENT_SPECIFIC);
         
         if (match) {
-            const [fullMatch, dataType, clientId, rateStr, batchStr] = match;
-            const rate = parseInt(rateStr);
-            const batchSize = batchStr ? parseInt(batchStr) : Math.max(1, Math.floor(rate / 10));
+            const [, dataType, clientId, rateStr, batchStr] = match;
+            const rate = parseInt(rateStr, 10);
+            const batchSize = batchStr ? parseInt(batchStr, 10) : protocol.defaultBatchSize(rate);
             
             console.log(`📝 Client-specific trigger pattern matched:`);
             console.log(`   DataType: ${dataType}, ClientId: ${clientId}, Rate: ${rate}, BatchSize: ${batchSize}`);
             
             // Look for client-specific subscription: /snapshot/{dataType}/{clientId}
-            const clientSpecificTopic = `/snapshot/${dataType}/${clientId}`;
+            const clientSpecificTopic = protocol.clientSubscriptionDestination(dataType, clientId);
             let subscription = null;
             
             for (const sub of this.subscriptions.values()) {
@@ -490,17 +485,17 @@ class StompConnection {
                 
                 // Send error message to client
                 this.send('MESSAGE', {
-                    'destination': '/errors',
-                    'message-id': `error-${Date.now()}`
+                    [protocol.HEADER.DESTINATION]: protocol.DESTINATION_ERRORS,
+                    [protocol.HEADER.MESSAGE_ID]: `error-${Date.now()}`
                 }, `Error: No subscription found for ${clientSpecificTopic}. Please subscribe first.`);
             }
         } else {
             // Backward compatibility: Check for legacy pattern
-            const legacyMatch = requestString.match(/^\/snapshot\/(positions|trades)\/(\d+)(?:\/(\d+))?$/);
+            const legacyMatch = requestString.match(protocol.TRIGGER_LEGACY);
             if (legacyMatch) {
-                const [fullMatch, dataType, rateStr, batchStr] = legacyMatch;
-                const rate = parseInt(rateStr);
-                const batchSize = batchStr ? parseInt(batchStr) : Math.max(1, Math.floor(rate / 10));
+                const [, dataType, rateStr, batchStr] = legacyMatch;
+                const rate = parseInt(rateStr, 10);
+                const batchSize = batchStr ? parseInt(batchStr, 10) : protocol.defaultBatchSize(rate);
                 
                 console.log(`📝 Legacy pattern detected - using generic topic`);
                 console.log(`   DataType: ${dataType}, Rate: ${rate}, BatchSize: ${batchSize}`);
@@ -508,7 +503,7 @@ class StompConnection {
                 // Find generic subscription
                 let subscription = null;
                 for (const sub of this.subscriptions.values()) {
-                    if (sub.destination === `/snapshot/${dataType}`) {
+                    if (sub.destination === protocol.genericSubscriptionDestination(dataType)) {
                         subscription = sub;
                         break;
                     }
@@ -532,8 +527,7 @@ class StompConnection {
         let index = 0;
         let batchNumber = 1;
         
-        // Fixed 10ms interval for snapshot batches
-        const snapshotBatchInterval = 10; // milliseconds
+        const snapshotBatchInterval = protocol.SNAPSHOT_BATCH_INTERVAL_MS;
         
         // Track delivered records for live updates
         const deliveredRecords = [];
@@ -542,10 +536,10 @@ class StompConnection {
             if (index >= data.length) {
                 // Send success message
                 this.send('MESSAGE', {
-                    'subscription': subscription.id,
-                    'message-id': `msg-${Date.now()}`,
-                    'destination': subscription.destination
-                }, `Success: All ${data.length} ${dataType} snapshot records delivered. Starting live updates...`);
+                    [protocol.HEADER.SUBSCRIPTION]: subscription.id,
+                    [protocol.HEADER.MESSAGE_ID]: `msg-${Date.now()}`,
+                    [protocol.HEADER.DESTINATION]: subscription.destination
+                }, protocol.legacySnapshotCompleteText(data.length, dataType));
                 
                 console.log(`📊 SNAPSHOT COMPLETE: ${dataType}, Rate: ${rate}/sec, Batch Size: ${batchSize}, Total Batches: ${batchNumber - 1}`);
                 
@@ -584,10 +578,11 @@ class StompConnection {
             }
             
             this.send('MESSAGE', {
-                'subscription': subscription.id,
-                'message-id': `msg-${Date.now()}-${Math.random()}`,
-                'destination': subscription.destination,
-                'content-type': 'application/json'
+                [protocol.HEADER.SUBSCRIPTION]: subscription.id,
+                [protocol.HEADER.MESSAGE_ID]: `msg-${Date.now()}-${Math.random()}`,
+                [protocol.HEADER.DESTINATION]: subscription.destination,
+                [protocol.HEADER.CONTENT_TYPE]: 'application/json',
+                [protocol.HEADER.MESSAGE_TYPE]: protocol.MESSAGE_TYPE.SNAPSHOT
             }, JSON.stringify(updatedBatch));
             
             console.log(`📦 SNAPSHOT BATCH ${batchNumber}: ${dataType}, Rate: ${rate}/sec, Batch Size: ${actualBatchSize}, Progress: ${index + actualBatchSize}/${data.length} (${((index + actualBatchSize) / data.length * 100).toFixed(1)}%)`);
@@ -638,10 +633,11 @@ class StompConnection {
             }
             
             this.send('MESSAGE', {
-                'subscription': subscription.id,
-                'message-id': `msg-${Date.now()}-${Math.random()}`,
-                'destination': subscription.destination,
-                'content-type': 'application/json'
+                [protocol.HEADER.SUBSCRIPTION]: subscription.id,
+                [protocol.HEADER.MESSAGE_ID]: `msg-${Date.now()}-${Math.random()}`,
+                [protocol.HEADER.DESTINATION]: subscription.destination,
+                [protocol.HEADER.CONTENT_TYPE]: 'application/json',
+                [protocol.HEADER.MESSAGE_TYPE]: protocol.MESSAGE_TYPE.LIVE_UPDATE
             }, JSON.stringify([update]));
             
             const recordId = dataType === 'positions' ? update.positionId : update.tradeId;
@@ -679,7 +675,7 @@ class StompConnection {
         let index = 0;
         let batchNumber = 1;
         
-        const snapshotBatchInterval = 10; // 10ms intervals for snapshots
+        const snapshotBatchInterval = protocol.SNAPSHOT_BATCH_INTERVAL_MS;
         const deliveredRecords = [];
         const streamKey = `${dataType}-${clientId}`;
         
@@ -700,12 +696,12 @@ class StompConnection {
             if (index >= data.length) {
                 // Snapshot complete - send success message
                 this.send('MESSAGE', {
-                    'subscription': subscription.id,
-                    'message-id': `msg-${Date.now()}`,
-                    'destination': subscription.destination,
-                    'client-id': clientId,
-                    'message-type': 'snapshot-complete'
-                }, `Success: All ${data.length} ${dataType} records delivered to client '${clientId}'. Starting live updates...`);
+                    [protocol.HEADER.SUBSCRIPTION]: subscription.id,
+                    [protocol.HEADER.MESSAGE_ID]: `msg-${Date.now()}`,
+                    [protocol.HEADER.DESTINATION]: subscription.destination,
+                    [protocol.HEADER.CLIENT_ID]: clientId,
+                    [protocol.HEADER.MESSAGE_TYPE]: protocol.MESSAGE_TYPE.SNAPSHOT_COMPLETE
+                }, protocol.clientSnapshotCompleteText(data.length, dataType, clientId));
                 
                 console.log(`📊 SNAPSHOT COMPLETE for client '${clientId}': ${deliveredRecords.length} records delivered`);
                 
@@ -720,13 +716,13 @@ class StompConnection {
             
             // Send to client-specific topic
             this.send('MESSAGE', {
-                'subscription': subscription.id,
-                'message-id': `msg-${Date.now()}-batch-${batchNumber}`,
-                'destination': subscription.destination,
-                'content-type': 'application/json',
-                'batch-number': batchNumber,
-                'client-id': clientId,
-                'message-type': 'snapshot'
+                [protocol.HEADER.SUBSCRIPTION]: subscription.id,
+                [protocol.HEADER.MESSAGE_ID]: `msg-${Date.now()}-batch-${batchNumber}`,
+                [protocol.HEADER.DESTINATION]: subscription.destination,
+                [protocol.HEADER.CONTENT_TYPE]: 'application/json',
+                [protocol.HEADER.BATCH_NUMBER]: String(batchNumber),
+                [protocol.HEADER.CLIENT_ID]: clientId,
+                [protocol.HEADER.MESSAGE_TYPE]: protocol.MESSAGE_TYPE.SNAPSHOT
             }, JSON.stringify(batch));
             
             console.log(`📦 Client '${clientId}' batch ${batchNumber}: ${batch.length} records (${index + 1}-${endIndex}/${data.length})`);
@@ -766,13 +762,13 @@ class StompConnection {
             
             // Send to client-specific topic
             this.send('MESSAGE', {
-                'subscription': subscription.id,
-                'message-id': `msg-${Date.now()}-${Math.random()}`,
-                'destination': subscription.destination,
-                'content-type': 'application/json',
-                'message-type': 'live-update',
-                'client-id': clientId,
-                'update-number': updateNumber
+                [protocol.HEADER.SUBSCRIPTION]: subscription.id,
+                [protocol.HEADER.MESSAGE_ID]: `msg-${Date.now()}-${Math.random()}`,
+                [protocol.HEADER.DESTINATION]: subscription.destination,
+                [protocol.HEADER.CONTENT_TYPE]: 'application/json',
+                [protocol.HEADER.MESSAGE_TYPE]: protocol.MESSAGE_TYPE.LIVE_UPDATE,
+                [protocol.HEADER.CLIENT_ID]: clientId,
+                [protocol.HEADER.UPDATE_NUMBER]: String(updateNumber)
             }, JSON.stringify([update]));
             
             const recordId = dataType === 'positions' ? update.positionId : update.tradeId;
@@ -796,7 +792,7 @@ class StompConnection {
             }
             
             // Stop any client-specific live updates for this subscription
-            if (subscription.destination.match(/^\/snapshot\/(positions|trades)\/[^/]+$/)) {
+            if (subscription.destination.match(protocol.CLIENT_TOPIC_REGEX)) {
                 const parts = subscription.destination.split('/');
                 const dataType = parts[2];
                 const clientId = parts[3];
